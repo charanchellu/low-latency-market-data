@@ -1,223 +1,185 @@
 # Low-Latency C++ Market Data Feed Handler
 
-A low-latency C++20 market-data pipeline that connects to Binance WebSocket trade streams, parses incoming market data, and transfers normalized messages through a cache-line-aligned SPSC ring buffer for low-overhead producer-consumer communication.
+A C++20 market-data ingestion and processing system focused on asynchronous networking, lock-free inter-thread communication, CPU affinity, Linux CPU isolation, and nanosecond-resolution queue-latency measurement.
+
+The project explores systems-level performance optimization techniques relevant to low-latency trading infrastructure and HFT engineering.
 
 ## Overview
 
-This project focuses on the systems engineering challenges involved in building a low-latency market-data pipeline:
+The application connects to live market-data WebSocket streams, receives and parses incoming messages, and transfers them from the network I/O thread to a dedicated processing thread through a fixed-capacity SPSC ring buffer.
+
+The primary objective is to investigate how thread placement and Linux CPU isolation influence latency and scheduling consistency.
+
+## Architecture
 
 ```text
-Binance WebSocket
-       │
-       ▼
-Boost.Asio / Beast
-       │
-       ▼
-TLS / OpenSSL
-       │
-       ▼
-JSON Message Parsing
-       │
-       ▼
-Timestamp
-       │
-       ▼
-SPSC Ring Buffer
-       │
-       ▼
-Consumer Thread
-       │
-       ▼
-Latency Measurement
+       Live Market Data
+              |
+              v
+    Boost.Asio / Beast
+       WebSocket I/O
+              |
+              v
+       Message Parsing
+              |
+              v
+    Lock-Free SPSC Ring
+              |
+              v
+      Processing Thread
+              |
+              v
+       Latency Metrics
+    P50 / P99 / P99.9 / Max
 ```
 
-The current implementation subscribes to Binance trade streams for:
+### Threading model
 
-* BTCUSDT
-* ETHUSDT
-* SOLUSDT
+| Component | CPU | Responsibility |
+|---|---:|---|
+| I/O thread | 0 | WebSocket communication, message reception and queue production |
+| Processing thread | 2 | Queue consumption and message processing |
 
-## Key Features
+The threads communicate through a single-producer, single-consumer ring buffer.
 
-* C++20 asynchronous networking
-* Binance WebSocket market-data ingestion
-* TLS using OpenSSL
-* Boost.Asio asynchronous I/O
-* Boost.Beast WebSocket implementation
-* Lock-free SPSC ring buffer
-* Cache-line-aligned producer/consumer indices
-* Atomic operations with acquire/release memory ordering
-* Busy-spin consumer
-* Architecture-specific CPU relaxation
-* Producer-to-consumer queue latency measurement
-* P50, P99, P99.9 and maximum latency tracking
+## Technology Stack
 
-## SPSC Ring Buffer
+- **C++20** – systems programming
+- **Boost.Asio** – asynchronous I/O
+- **Boost.Beast** – WebSocket communication
+- **Linux pthreads** – thread management and CPU affinity
+- **SPSC ring buffer** – lock-free producer-consumer communication
+- **Linux kernel parameters** – CPU isolation and housekeeping optimization
+- **CMake / compiler toolchain** – build environment, where configured
 
-The core communication mechanism is a fixed-size **Single Producer Single Consumer (SPSC)** ring buffer.
+## Performance Engineering
 
-```text
-             Producer
-                │
-                │ try_push()
-                ▼
-      ┌─────────────────────┐
-      │                     │
-      │     SPSC Buffer     │
-      │                     │
-      │  [ ][ ][ ][ ][ ]   │
-      │                     │
-      └─────────────────────┘
-                │
-                │ try_pop()
-                ▼
-             Consumer
-```
+The project investigates several low-level optimization techniques.
 
-The producer owns the `head` index and the consumer owns the `tail` index.
+### 1. CPU affinity
 
-The indices are implemented using atomics with acquire/release memory ordering to establish the required producer-consumer synchronization without using a mutex.
-
-## Cache-Line Alignment
-
-The producer and consumer indices are cache-line aligned to reduce the possibility of **false sharing** between the two threads.
+Worker threads are pinned to specific logical CPUs using:
 
 ```cpp
-alignas(64) std::atomic<size_t> head_;
-alignas(64) std::atomic<size_t> tail_;
+pthread_setaffinity_np()
 ```
 
-This keeps frequently modified synchronization variables separated across cache lines.
+Current placement:
 
-## CPU Relaxation
+- I/O thread → CPU 0
+- Processing thread → CPU 2
 
-The consumer uses architecture-specific relaxation while waiting for new messages.
+This provides explicit control over worker-thread placement.
 
-### x86-64
+### 2. Linux CPU isolation
 
-```cpp
-_mm_pause();
-```
-
-### ARM64
-
-```asm
-yield
-```
-
-### Fallback
-
-```cpp
-std::this_thread::yield();
-```
-
-This allows the consumer to busy-spin without simply executing the polling loop at maximum aggressiveness.
-
-## Latency Measurement
-
-The benchmark measures **producer-to-consumer queue residence time**.
-
-The timestamp is captured immediately before inserting a message into the SPSC queue:
+Kernel boot parameters used in the experiment:
 
 ```text
-Producer
-   │
-   │ timestamp
-   ▼
-try_push()
-   │
-   ▼
-SPSC Queue
-   │
-   ▼
-try_pop()
-   │
-   ▼
-Consumer
-   │
-   ▼
-latency = consumer_time - producer_timestamp
+isolcpus=0,2
+nohz_full=0,2
+rcu_nocbs=0,2
 ```
 
-This measurement does **not** represent end-to-end network latency. Network transmission, WebSocket processing, and JSON parsing before the timestamp are outside the measured queue latency.
+These configure scheduler-domain isolation, tick reduction where supported, and RCU callback offloading for the selected CPUs.
 
-## Live Binance Benchmark
+### 3. Lock-free SPSC communication
 
-A 2-minute live Binance trade-stream run produced:
+The network thread produces messages while the processing thread consumes them.
 
-| Metric |                Result |
-| ------ | --------------------: |
-| P50    | **125 ns (0.125 µs)** |
-| P99    | **417 ns (0.417 µs)** |
-| P99.9  |          **8.125 µs** |
+The ring buffer avoids conventional mutex-based synchronization on the producer-consumer handoff path.
 
-The P99.9 result shows a substantially longer latency tail compared with the median and P99 measurements, motivating further investigation into scheduling, CPU migration, and system-level effects.
+### 4. Latency measurement
 
-## Benchmark Roadmap
+Queue latency is measured from the producer-side timestamp to the consumer-side timestamp.
 
-The project is being benchmarked in stages:
+The benchmark reports:
 
-### 1. Live Market-Data Baseline
+- Average queue latency
+- Maximum observed queue latency
+- P50 latency
+- P99 latency
+- P99.9 latency
+- Message throughput
+- Dropped messages
 
-Measure the complete Binance ingestion pipeline under a real market-data workload.
+**Measurement scope:** These figures represent internal producer-to-consumer queue latency, not end-to-end network latency.
 
-### 2. Synthetic SPSC Benchmark
+## Benchmark Results
 
-Remove network and parsing overhead and measure the SPSC queue independently.
+### Experimental setup
 
-Planned measurements:
+Two configurations were evaluated using approximately two-minute live market-data sessions.
 
-* Maximum throughput
-* P50 latency
-* P99 latency
-* P99.9 latency
-* Maximum latency
-* Message drops
+- Baseline: normal Linux CPU scheduling.
+- Optimized: CPU affinity and Linux CPU isolation.
 
-### 3. CPU Affinity Experiment
+### Results
 
-Compare unrestricted scheduling against producer/consumer CPU affinity.
+| Metric | Baseline | Affinity + Isolation |
+|---|---:|---:|
+| P50 | 191 ns | 174 ns |
+| P99 | 193.616 µs | 299 ns |
+| P99.9 | 501.097 µs | 613 ns |
+| Maximum observed | 539.917 µs | 1.077 µs |
+| Average queue latency | 4.458 µs | 181 ns |
+| Throughput | 140.02 msg/s | 163.38 msg/s |
+| Dropped messages | 0 | 0 |
 
-```text
-Baseline
+### Observations
 
-Producer ──► Scheduler ──► CPU
-Consumer ──► Scheduler ──► CPU
+The most notable differences appeared in the latency tail:
 
+- P99 latency was approximately 99.85% lower.
+- P99.9 latency was approximately 99.88% lower.
+- Maximum observed latency was approximately 99.80% lower.
+- Average queue latency was approximately 95.9% lower.
 
-Affinity
+These are encouraging observations from individual live runs, not proof that CPU isolation alone caused the entire improvement. Repeated controlled experiments are needed to establish reproducibility.
 
-Producer ───────────────► CPU X
-Consumer ───────────────► CPU Y
+Throughput is dependent on incoming live market-data activity and should not be interpreted as maximum processing capacity.
+
+## Linux Environment
+
+The optimization experiments were conducted on an Intel-based laptop running Ubuntu Linux.
+
+The implementation uses Linux-specific thread affinity and kernel boot parameters.
+
+To inspect isolated CPUs:
+
+```bash
+cat /sys/devices/system/cpu/isolated
 ```
 
-The goal is to investigate the effect of CPU scheduling and migration on latency, particularly tail latency.
+To launch the application with a CPU restriction using systemd:
 
-## Technologies
-
-* **C++20**
-* **Boost.Asio**
-* **Boost.Beast**
-* **OpenSSL**
-* **WebSockets**
-* **TCP/IP**
-* **STL Atomics**
-* **CMake**
-* **Git**
-
-```text
+```bash
+sudo systemd-run --scope \
+  --unit=feed-handler \
+  -p AllowedCPUs=0,2 \
+  ./feed_handler
 ```
 
-## Purpose
+Note: CPU affinity, scheduler isolation, and cgroup CPU restrictions are separate mechanisms.
 
-This project is designed as a systems-oriented exploration of:
+## Current Development Focus
 
-* Low-latency C++ programming
-* Lock-free data structures
-* Memory ordering
-* CPU/cache behavior
-* Asynchronous networking
-* Market-data ingestion
-* Latency and throughput benchmarking
+- Cache-line alignment and false-sharing analysis
+- CPU migration and context-switch profiling
+- Network interrupt and softirq analysis
+- Improved latency measurement methodology
+- Controlled synthetic benchmarking
+- Order book construction and market-data processing
+- Further Linux performance optimization
 
-The long-term goal is to extend the pipeline toward a more complete low-latency trading infrastructure stack.
+## Project Motivation
+
+This project is an exploration of the engineering principles behind latency-sensitive C++ systems.
+
+The focus is not simply on achieving a low latency number, but on understanding the interactions between application architecture, CPU topology, thread scheduling, synchronization, and operating-system behavior.
+
+**Measure. Profile. Optimize. Repeat.**
+
+## Disclaimer
+
+This is an educational and experimental market-data processing project. The benchmark figures are environment-specific observations and are not representative of production HFT infrastructure or exchange-to-execution latency.
